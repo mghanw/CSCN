@@ -6,7 +6,7 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from .results import iter_cell_compact, load_compact_results, load_manifest
+from .results import build_result_paths, iter_cell_compact, load_graph_batch, load_manifest
 
 
 BETA_MODES = {"blend", "clipped_blend", "expression", "rank_blend", "uniform"}
@@ -266,8 +266,15 @@ def build_ckm(
     module_frames = []
     for module_path in sorted(module_dir.glob('module_*_expression.csv')):
         module_name = module_path.stem
-        batch = load_compact_results(result_dir / module_name)
-        node_df = load_node_values(module_path, result_dir / module_name)
+        module_result_dir = result_dir / module_name
+        paths = build_result_paths(module_result_dir)
+        manifest = load_manifest(module_result_dir)
+        if str(manifest.get('tf_prior_mode', 'none') or 'none') == 'atac_prior_cscn':
+            graph_path = paths.atac_prior_graph_path
+        else:
+            graph_path = paths.dag_representation_path
+        batch = load_graph_batch(graph_path)
+        node_df = load_node_values(module_path, module_result_dir)
         if batch.n_cells != node_df.shape[0]:
             raise ValueError(f'Cell count mismatch for {module_name}: {batch.n_cells} vs {node_df.shape[0]}')
         if batch.node_count != node_df.shape[1]:

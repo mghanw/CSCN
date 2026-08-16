@@ -4,6 +4,7 @@ from importlib import import_module
 
 __all__ = [
     'CSCN',
+    'CellPCResult',
     'RunConfig',
     'PreprocessConfig',
     'RunResult',
@@ -17,6 +18,7 @@ __all__ = [
 
 _EXPORTS = {
     'CSCN': ('cscn.core', 'CSCN'),
+    'CellPCResult': ('cscn.core', 'CellPCResult'),
     'RunConfig': ('cscn.config', 'RunConfig'),
     'PreprocessConfig': ('cscn.config', 'PreprocessConfig'),
     'RunResult': ('cscn.runner', 'RunResult'),

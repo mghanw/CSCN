@@ -19,6 +19,8 @@ from sklearn.decomposition import NMF
 
 UNBOUNDED_RANGE = (1, 0)
 QUERY_ENGINES = {"bitmap", "hybrid", "kdt_debug"}
+CI_ALTERNATIVES = {"two-sided", "greater"}
+COLLIDER_CONFLICT_POLICIES = {"prioritize_existing", "overwrite"}
 CELL_BACKENDS = {"serial", "process"}
 TF_WEIGHTED_PRIOR_MODES = {
     "atac_prior_cscn",
@@ -28,6 +30,26 @@ TF_SKELETON_PRIOR_MODES = {
 }
 ATAC_CI_MODES = {"none", "joint_rna_atac_conditioned_cscn"}
 ATAC_CI_PROFILE_MODES = {"max", "weighted_sum"}
+CI_EPSILON = 1e-10
+
+
+def _calculate_ci_p_value(rho: float, std_deviation: float, alternative: str) -> float:
+    rho = float(rho)
+    std_deviation = float(std_deviation)
+    if std_deviation <= CI_EPSILON:
+        if abs(rho) <= CI_EPSILON:
+            z_score = 0.0
+        elif alternative == "greater":
+            return 0.0 if rho > 0.0 else 1.0
+        else:
+            return 0.0
+    else:
+        z_score = rho / std_deviation
+    if alternative == "greater":
+        p_value = norm.sf(z_score)
+    else:
+        p_value = 2.0 * norm.sf(abs(z_score))
+    return float(np.clip(p_value, 0.0, 1.0))
 
 
 @dataclass(frozen=True)
@@ -48,6 +70,13 @@ class ExpertKnowledge:
         object.__setattr__(self, "required_edges", tuple(required_edges or ()))
         object.__setattr__(self, "temporal_ordering", dict(temporal_ordering or {}))
         object.__setattr__(self, "temporal_order", tuple(tuple(group) for group in (temporal_order or ((),))))
+
+
+@dataclass(frozen=True)
+class CellPCResult:
+    cell_index: int
+    pdag: nx.DiGraph
+    dag_representation: nx.DiGraph
 
 
 class KDT_Node:
@@ -221,10 +250,10 @@ def _init_pc_worker(cscn_instance):
     _PC_WORKER = cscn_instance
 
 
-def _run_pc_worker_batch(task_ids):
+def _run_pc_worker_batch(cell_indices):
     if _PC_WORKER is None:
         raise RuntimeError("PC worker is not initialized")
-    return [_PC_WORKER.run_pc_for_task(task_id) for task_id in task_ids]
+    return [_PC_WORKER.infer_cell_pc(cell_index) for cell_index in cell_indices]
 
 
 class CSCN:
@@ -260,9 +289,17 @@ class CSCN:
         atac_ci_open_threshold=0.0,
         atac_ci_profile_mode="max",
         variable_names=None,
+        ci_alternative="two-sided",
+        collider_conflict_policy="prioritize_existing",
     ):
         if query_engine not in QUERY_ENGINES:
             raise ValueError(f"Unsupported query_engine: {query_engine}")
+        if ci_alternative not in CI_ALTERNATIVES:
+            raise ValueError(f"Unsupported ci_alternative: {ci_alternative}")
+        if collider_conflict_policy not in COLLIDER_CONFLICT_POLICIES:
+            raise ValueError(
+                f"Unsupported collider_conflict_policy: {collider_conflict_policy}"
+            )
         if atac_ci_mode not in ATAC_CI_MODES:
             raise ValueError(f"Unsupported atac_ci_mode: {atac_ci_mode}")
         if atac_ci_profile_mode not in ATAC_CI_PROFILE_MODES:
@@ -274,6 +311,8 @@ class CSCN:
         self.max_cond_vars = max_cond_vars
         self.pc_var = pc_var
         self.query_engine = query_engine
+        self.ci_alternative = ci_alternative
+        self.collider_conflict_policy = collider_conflict_policy
         self.use_bitmap = query_engine == "bitmap"
         self.debug = debug
         self.hybrid_subspace_dim = max(1, int(hybrid_subspace_dim))
@@ -428,17 +467,15 @@ class CSCN:
         self.tf_weighted_satisfied_weight = 0.0
         self.tf_weighted_available_weight = 0.0
         self.tf_weighted_satisfaction_rate = 0.0
-        self.tf_weighted_reversed_pc_edge_count = 0
-        self.tf_weighted_cycle_avoidance_flip_count = 0
-        self.tf_weighted_forced_cycle_edge_count = 0
+        self.tf_weighted_prior_reoriented_edge_count = 0
         self.tf_weighted_prior_conflict_edge_count = 0
 
     def _reset_tf_skeleton_stats(self):
         self.tf_skeleton_prior_pair_count = 0
         self.tf_skeleton_ci_query_count = 0
-        self.tf_skeleton_rescued_ci_count = 0
+        self.tf_skeleton_prior_supported_retention_count = 0
         self.external_skeleton_ci_query_count = 0
-        self.external_skeleton_rescued_ci_count = 0
+        self.external_skeleton_prior_supported_retention_count = 0
 
     def _reset_atac_ci_stats(self):
         self.atac_ci_gate_query_count = 0
@@ -450,9 +487,9 @@ class CSCN:
 
     def _reset_task_tf_skeleton_stats(self):
         self._task_tf_skeleton_ci_query_count = 0
-        self._task_tf_skeleton_rescued_ci_count = 0
+        self._task_tf_skeleton_prior_supported_retention_count = 0
         self._task_external_skeleton_ci_query_count = 0
-        self._task_external_skeleton_rescued_ci_count = 0
+        self._task_external_skeleton_prior_supported_retention_count = 0
 
     def _reset_task_atac_ci_stats(self):
         self._task_atac_ci_gate_query_count = 0
@@ -1040,6 +1077,7 @@ class CSCN:
                 self._normalize_gene_key(condition_set),
                 sigmoid_score,
                 effective_alpha,
+                self.ci_alternative,
                 atac_gate_key,
             )
             if ci_key in self.ci_cache:
@@ -1072,20 +1110,17 @@ class CSCN:
             xy_condition_set = condition_set.copy(); xy_condition_set.add(x_id); xy_condition_set.add(y_id)
             count_xy_z = count_with_optional_gate(xy_condition_set)
             rho = ((count_z * count_xy_z) - (count_x_z * count_y_z)) / (count_z ** 2)
-            epsilon = 1e-10
+            epsilon = CI_EPSILON
             variance_numerator = count_x_z * count_y_z * (count_z - count_x_z) * (count_z - count_y_z)
             variance_numerator = np.clip(variance_numerator, epsilon, None)
             variance_denominator = (count_z ** 4) * (count_z - 1)
             std_deviation = np.sqrt(variance_numerator / (variance_denominator + epsilon))
-            z_score = np.divide(rho, std_deviation, out=np.zeros_like(rho), where=(std_deviation > epsilon))
-            p_value = 2 * (1 - norm.cdf(abs(z_score)))
-            if std_deviation <= epsilon and np.abs(rho) > epsilon:
-                p_value = 0
+            p_value = _calculate_ci_p_value(rho, std_deviation, self.ci_alternative)
             result = bool(p_value > effective_alpha)
             if tf_prior_strength > 0.0 and p_value > float(significance_level) and not result:
-                self._task_tf_skeleton_rescued_ci_count += 1
+                self._task_tf_skeleton_prior_supported_retention_count += 1
             if external_prior_strength > 0.0 and p_value > float(significance_level) and not result:
-                self._task_external_skeleton_rescued_ci_count += 1
+                self._task_external_skeleton_prior_supported_retention_count += 1
             self.ci_cache[ci_key] = result
             return result
         except Exception as exc:
@@ -1127,16 +1162,12 @@ class CSCN:
         count_y = int(y_bits.count())
         count_xy = self._bitset_intersection_count((x_bits, y_bits))
         rho = ((count_z * count_xy) - (count_x * count_y)) / (count_z ** 2)
-        epsilon = 1e-10
+        epsilon = CI_EPSILON
         variance_numerator = count_x * count_y * (count_z - count_x) * (count_z - count_y)
         variance_numerator = np.clip(variance_numerator, epsilon, None)
         variance_denominator = (count_z ** 4) * (count_z - 1)
         std_deviation = np.sqrt(variance_numerator / (variance_denominator + epsilon))
-        z_score = np.divide(rho, std_deviation, out=np.zeros_like(rho), where=(std_deviation > epsilon))
-        p_value = float(2 * (1 - norm.cdf(abs(z_score))))
-        if std_deviation <= epsilon and np.abs(rho) > epsilon:
-            return 0.0
-        return max(0.0, min(1.0, p_value))
+        return _calculate_ci_p_value(rho, std_deviation, self.ci_alternative)
 
     def _tf_skeleton_prior_enabled(self) -> bool:
         return self.tf_prior_mode in TF_SKELETON_PRIOR_MODES and bool(self.tf_prior_weight_map)
@@ -1244,9 +1275,13 @@ class CSCN:
 
     def _annotate_tf_skeleton_stats(self, graph) -> None:
         graph.graph["tf_skeleton_ci_query_count"] = int(self._task_tf_skeleton_ci_query_count)
-        graph.graph["tf_skeleton_rescued_ci_count"] = int(self._task_tf_skeleton_rescued_ci_count)
+        graph.graph["tf_skeleton_prior_supported_retention_count"] = int(
+            self._task_tf_skeleton_prior_supported_retention_count
+        )
         graph.graph["external_skeleton_ci_query_count"] = int(self._task_external_skeleton_ci_query_count)
-        graph.graph["external_skeleton_rescued_ci_count"] = int(self._task_external_skeleton_rescued_ci_count)
+        graph.graph["external_skeleton_prior_supported_retention_count"] = int(
+            self._task_external_skeleton_prior_supported_retention_count
+        )
 
     def _annotate_atac_ci_stats(self, graph) -> None:
         graph.graph["atac_ci_gate_query_count"] = int(self._task_atac_ci_gate_query_count)
@@ -1350,11 +1385,11 @@ class CSCN:
         active_weight_map = self.tf_prior_weight_map if weight_map is None else weight_map
         return float(active_weight_map.get((str(source), str(target)), 0.0))
 
-    def _ordered_graph_nodes(self, dag) -> List[object]:
+    def _ordered_graph_nodes(self, graph) -> List[object]:
         candidates: List[object] = []
         if self.df is not None:
             candidates.extend(self.df.columns.tolist())
-        candidates.extend(list(dag.nodes()))
+        candidates.extend(list(graph.nodes()))
         nodes: List[object] = []
         seen: Set[str] = set()
         for node in candidates:
@@ -1365,20 +1400,19 @@ class CSCN:
             seen.add(key)
         return nodes
 
-    def _orient_dag_with_weighted_tf_prior(
+    def _build_atac_prior_graph(
         self,
-        dag,
+        dag_representation: nx.DiGraph,
         weight_map: Optional[Mapping[Tuple[str, str], float]] = None,
-        allow_cycles: bool = False,
-    ):
-        nodes = self._ordered_graph_nodes(dag)
+    ) -> Tuple[nx.DiGraph, Dict[str, float]]:
+        nodes = self._ordered_graph_nodes(dag_representation)
         node_order = {str(node): idx for idx, node in enumerate(nodes)}
 
         def node_sort_key(node):
             return (node_order.get(str(node), len(node_order)), str(node))
 
         skeleton: Dict[frozenset, Tuple[object, object]] = {}
-        for source, target in dag.edges():
+        for source, target in dag_representation.edges():
             if source == target:
                 continue
             pair_key = frozenset((source, target))
@@ -1416,27 +1450,21 @@ class CSCN:
             )
         )
 
-        oriented = nx.DiGraph()
-        oriented.add_nodes_from(nodes)
+        prior_graph = nx.DiGraph()
+        prior_graph.add_nodes_from(nodes)
         stats = {
             "candidate_edge_count": 0,
             "oriented_edge_count": 0,
             "satisfied_weight": 0.0,
             "available_weight": 0.0,
-            "reversed_pc_edge_count": 0,
-            "cycle_avoidance_flip_count": 0,
-            "forced_cycle_edge_count": 0,
+            "prior_reoriented_edge_count": 0,
             "prior_conflict_edge_count": 0,
         }
-
-        def would_create_cycle(source, target) -> bool:
-            return source == target or nx.has_path(oriented, target, source)
 
         for info in edge_infos:
             source = info["source"]
             target = info["target"]
             preferred_source, preferred_target = info["preferred"]
-            reverse_source, reverse_target = preferred_target, preferred_source
             priority_weight = float(info["priority_weight"])
             if priority_weight > 0:
                 stats["candidate_edge_count"] += 1
@@ -1445,129 +1473,42 @@ class CSCN:
                     stats["prior_conflict_edge_count"] += 1
 
             final_source, final_target = preferred_source, preferred_target
-            if not allow_cycles and would_create_cycle(final_source, final_target):
-                if not would_create_cycle(reverse_source, reverse_target):
-                    final_source, final_target = reverse_source, reverse_target
-                    stats["cycle_avoidance_flip_count"] += 1
-                else:
-                    stats["forced_cycle_edge_count"] += 1
-            oriented.add_edge(final_source, final_target)
+            prior_graph.add_edge(final_source, final_target)
 
             if (final_source, final_target) != (source, target):
-                stats["reversed_pc_edge_count"] += 1
+                stats["prior_reoriented_edge_count"] += 1
             final_weight = self._tf_prior_weight(final_source, final_target, weight_map=weight_map)
             if priority_weight > 0 and final_weight > 0:
                 stats["oriented_edge_count"] += 1
             stats["satisfied_weight"] += final_weight
 
-        return oriented, stats
+        return prior_graph, stats
 
-    def _project_bidirected_edges_with_weighted_tf_prior(
+    def build_atac_prior_graphs(
         self,
-        dag,
-        weight_map: Optional[Mapping[Tuple[str, str], float]] = None,
-    ):
-        nodes = self._ordered_graph_nodes(dag)
-        node_order = {str(node): idx for idx, node in enumerate(nodes)}
-
-        def node_sort_key(node):
-            return (node_order.get(str(node), len(node_order)), str(node))
-
-        pairs: Dict[frozenset, Tuple[object, object]] = {}
-        directed_edges: Set[Tuple[object, object]] = set()
-        for source, target in dag.edges():
-            if source == target:
-                continue
-            pair_key = frozenset((source, target))
-            if pair_key not in pairs:
-                left, right = sorted((source, target), key=node_sort_key)
-                pairs[pair_key] = (left, right)
-            directed_edges.add((source, target))
-
-        projected = nx.DiGraph()
-        projected.add_nodes_from(nodes)
-        stats = {
-            "candidate_edge_count": 0,
-            "oriented_edge_count": 0,
-            "satisfied_weight": 0.0,
-            "available_weight": 0.0,
-            "reversed_pc_edge_count": 0,
-            "cycle_avoidance_flip_count": 0,
-            "forced_cycle_edge_count": 0,
-            "prior_conflict_edge_count": 0,
-        }
-
-        for _, (left, right) in sorted(pairs.items(), key=lambda item: (node_sort_key(item[1][0]), node_sort_key(item[1][1]))):
-            left_to_right = (left, right) in directed_edges
-            right_to_left = (right, left) in directed_edges
-            if left_to_right and right_to_left:
-                forward_weight = self._tf_prior_weight(left, right, weight_map=weight_map)
-                reverse_weight = self._tf_prior_weight(right, left, weight_map=weight_map)
-                priority_weight = max(forward_weight, reverse_weight)
-                if priority_weight > 0:
-                    stats["candidate_edge_count"] += 1
-                    stats["available_weight"] += priority_weight
-                if forward_weight > 0 and reverse_weight > 0:
-                    stats["prior_conflict_edge_count"] += 1
-                if forward_weight > reverse_weight:
-                    projected.add_edge(left, right)
-                    stats["oriented_edge_count"] += 1
-                    stats["satisfied_weight"] += forward_weight
-                    stats["reversed_pc_edge_count"] += 1
-                elif reverse_weight > forward_weight:
-                    projected.add_edge(right, left)
-                    stats["oriented_edge_count"] += 1
-                    stats["satisfied_weight"] += reverse_weight
-                    stats["reversed_pc_edge_count"] += 1
-                else:
-                    projected.add_edge(left, right)
-                    projected.add_edge(right, left)
-                    stats["satisfied_weight"] += priority_weight
-            elif left_to_right:
-                projected.add_edge(left, right)
-            elif right_to_left:
-                projected.add_edge(right, left)
-
-        projected.graph.update(getattr(dag, "graph", {}))
-        projected.graph["tf_weighted_projection_mode"] = "bidirected_only"
-        return projected, stats
-
-    def apply_tf_weighted_orientation(
-        self,
-        records: Sequence[Tuple[int, object]],
-        allow_cycles: bool = False,
-        projection_only: bool = False,
-    ) -> List[Tuple[int, object]]:
+        pc_results: Sequence[CellPCResult],
+    ) -> List[Tuple[int, nx.DiGraph]]:
         self._reset_tf_weighted_orientation_stats()
-        if not self.tf_prior_weight_map:
-            return list(records)
-        oriented_records: List[Tuple[int, object]] = []
+        graph_records: List[Tuple[int, nx.DiGraph]] = []
         total_candidate_edges = 0
         total_oriented_edges = 0
         total_satisfied_weight = 0.0
         total_available_weight = 0.0
-        total_reversed_pc_edges = 0
-        total_cycle_flips = 0
-        total_forced_cycles = 0
+        total_prior_reoriented_edges = 0
         total_prior_conflicts = 0
-        for task_id, dag in records:
-            if projection_only:
-                oriented_dag, stats = self._project_bidirected_edges_with_weighted_tf_prior(
-                    dag,
+        for pc_result in sorted(pc_results, key=lambda result: int(result.cell_index)):
+            dag_representation = pc_result.dag_representation
+            if not nx.is_directed_acyclic_graph(dag_representation):
+                raise ValueError(
+                    f"Cell {pc_result.cell_index} DAG representation is cyclic"
                 )
-            else:
-                oriented_dag, stats = self._orient_dag_with_weighted_tf_prior(
-                    dag,
-                    allow_cycles=allow_cycles,
-                )
-            oriented_records.append((int(task_id), oriented_dag))
+            prior_graph, stats = self._build_atac_prior_graph(dag_representation)
+            graph_records.append((int(pc_result.cell_index), prior_graph))
             total_candidate_edges += int(stats["candidate_edge_count"])
             total_oriented_edges += int(stats["oriented_edge_count"])
             total_satisfied_weight += float(stats["satisfied_weight"])
             total_available_weight += float(stats["available_weight"])
-            total_reversed_pc_edges += int(stats["reversed_pc_edge_count"])
-            total_cycle_flips += int(stats["cycle_avoidance_flip_count"])
-            total_forced_cycles += int(stats["forced_cycle_edge_count"])
+            total_prior_reoriented_edges += int(stats["prior_reoriented_edge_count"])
             total_prior_conflicts += int(stats["prior_conflict_edge_count"])
         self.tf_weighted_candidate_edge_count = int(total_candidate_edges)
         self.tf_weighted_oriented_edge_count = int(total_oriented_edges)
@@ -1576,11 +1517,11 @@ class CSCN:
         self.tf_weighted_satisfaction_rate = (
             float(total_satisfied_weight / total_available_weight) if total_available_weight > 0 else 0.0
         )
-        self.tf_weighted_reversed_pc_edge_count = int(total_reversed_pc_edges)
-        self.tf_weighted_cycle_avoidance_flip_count = int(total_cycle_flips)
-        self.tf_weighted_forced_cycle_edge_count = int(total_forced_cycles)
+        self.tf_weighted_prior_reoriented_edge_count = int(
+            total_prior_reoriented_edges
+        )
         self.tf_weighted_prior_conflict_edge_count = int(total_prior_conflicts)
-        return oriented_records
+        return graph_records
 
     def _prepare_combined_expert_knowledge(self) -> None:
         self.combined_expert_knowledge = None
@@ -1729,7 +1670,7 @@ class CSCN:
             lim_neighbors += 1
         return graph, separating_sets
 
-    def _orient_colliders_deterministic(
+    def _orient_unshielded_colliders(
         self,
         skeleton: nx.Graph,
         separating_sets: Mapping[frozenset[object], Sequence[object]],
@@ -1742,9 +1683,10 @@ class CSCN:
         for left, right in self._sorted_undirected_edges(skeleton):
             pdag.add_edge(left, right)
             pdag.add_edge(right, left)
-        for left in nodes:
-            for right in nodes:
-                if left == right or skeleton.has_edge(left, right):
+        proposals: List[Tuple[object, object, object]] = []
+        for left_index, left in enumerate(nodes):
+            for right in nodes[left_index + 1:]:
+                if skeleton.has_edge(left, right):
                     continue
                 separating_set = set(separating_sets.get(frozenset((left, right)), ()))
                 shared = self._sorted_nodes(set(skeleton.neighbors(left)) & set(skeleton.neighbors(right)))
@@ -1756,10 +1698,22 @@ class CSCN:
                             continue
                         if int(temporal_ordering[center]) < int(temporal_ordering[right]):
                             continue
-                    if pdag.has_edge(center, left):
-                        pdag.remove_edge(center, left)
-                    if pdag.has_edge(center, right):
-                        pdag.remove_edge(center, right)
+                    proposals.append((left, center, right))
+        for left, center, right in proposals:
+            oriented_edges = ((left, center), (right, center))
+            conflicts_with_existing = any(
+                pdag.has_edge(target, source) and not pdag.has_edge(source, target)
+                for source, target in oriented_edges
+            )
+            if (
+                conflicts_with_existing
+                and self.collider_conflict_policy == "prioritize_existing"
+            ):
+                continue
+            for source, target in oriented_edges:
+                pdag.add_edge(source, target)
+                if pdag.has_edge(target, source):
+                    pdag.remove_edge(target, source)
         return pdag
 
     def _check_incoming_edges_deterministic(self, pdag: nx.DiGraph, source, target) -> bool:
@@ -1781,7 +1735,7 @@ class CSCN:
         )
         return bool(nx.has_path(directed_only, source, target))
 
-    def _apply_orientation_rules_deterministic(self, pdag: nx.DiGraph, apply_r4: bool = False) -> nx.DiGraph:
+    def _apply_meek_rules(self, pdag: nx.DiGraph, apply_r4: bool = False) -> nx.DiGraph:
         nodes = self._sorted_nodes(pdag.nodes())
         progress = True
         while progress:
@@ -1840,24 +1794,29 @@ class CSCN:
             progress = num_edges > pdag.number_of_edges()
         return pdag
 
-    def _pdag_to_dag_deterministic(self, pdag: nx.DiGraph) -> nx.DiGraph:
+    def _build_dag_representation(self, pdag: nx.DiGraph) -> nx.DiGraph:
         dag = nx.DiGraph()
         dag.add_nodes_from(self._sorted_nodes(pdag.nodes()))
         directed_edges = [
             (left, right)
             for left, right in pdag.edges()
-            if not pdag.has_edge(right, left)
+            if left != right and not pdag.has_edge(right, left)
         ]
         for left, right in sorted(directed_edges, key=lambda edge: (self._node_sort_key(edge[0]), self._node_sort_key(edge[1]))):
             dag.add_edge(left, right)
+        if not nx.is_directed_acyclic_graph(dag):
+            raise ValueError(
+                "Cannot build DAG representation: fixed directed edges contain a cycle"
+            )
         working = pdag.copy()
+        working.remove_edges_from(nx.selfloop_edges(working))
         while working.number_of_nodes() > 0:
             found = False
             for node in self._sorted_nodes(working.nodes()):
                 directed_outgoing = set(working.successors(node)) - set(working.predecessors(node))
                 undirected_neighbors = set(working.successors(node)) & set(working.predecessors(node))
                 neighbors_are_clique = all(
-                    working.has_edge(left, right)
+                    working.has_edge(left, right) or working.has_edge(right, left)
                     for right in working.predecessors(node)
                     for left in undirected_neighbors
                     if left != right
@@ -1873,14 +1832,31 @@ class CSCN:
                 break
             if found:
                 continue
-            remaining_edges = sorted(
-                working.edges(),
-                key=lambda edge: (self._node_sort_key(edge[0]), self._node_sort_key(edge[1])),
+            topological_order = list(
+                nx.lexicographical_topological_sort(dag, key=self._node_sort_key)
             )
-            for left, right in remaining_edges:
-                dag.add_edge(left, right)
+            order_by_node = {node: index for index, node in enumerate(topological_order)}
+            undirected_pairs: Dict[frozenset[object], Tuple[object, object]] = {}
+            for left, right in working.edges():
+                if left == right or not working.has_edge(right, left):
+                    continue
+                pair = frozenset((left, right))
+                if pair in undirected_pairs:
+                    continue
+                first, second = self._sorted_nodes((left, right))
+                undirected_pairs[pair] = (first, second)
+            for first, second in sorted(
+                undirected_pairs.values(),
+                key=lambda pair: (self._node_sort_key(pair[0]), self._node_sort_key(pair[1])),
+            ):
+                if order_by_node[first] < order_by_node[second]:
+                    dag.add_edge(first, second)
+                else:
+                    dag.add_edge(second, first)
             dag.graph["pc_orientation_fallback"] = True
             break
+        if not nx.is_directed_acyclic_graph(dag):
+            raise RuntimeError("DAG representation construction produced a cycle")
         return dag
 
     def _pc_search_kwargs(self, key_cell_idx):
@@ -1916,10 +1892,11 @@ class CSCN:
         directed.graph["pc_orientation_fallback"] = True
         return directed
 
-    def run_pc(self, key_cell_idx):
+    def infer_cell_pc(self, cell_index: int) -> CellPCResult:
+        self.clear_task_cache()
         expert_knowledge = self.combined_expert_knowledge
         skeleton, separating_sets = self._build_deterministic_pc_skeleton(
-            key_cell_idx=int(key_cell_idx),
+            key_cell_idx=int(cell_index),
             expert_knowledge=expert_knowledge,
             enforce_expert_knowledge=expert_knowledge is not None,
         )
@@ -1928,38 +1905,38 @@ class CSCN:
         if expert_knowledge is not None:
             temporal_ordering = dict(getattr(expert_knowledge, "temporal_ordering", {}) or {})
             apply_r4 = bool(getattr(expert_knowledge, "temporal_order", [[]]) != [[]])
-        pdag = self._orient_colliders_deterministic(
+        pdag = self._orient_unshielded_colliders(
             skeleton,
             separating_sets,
             temporal_ordering=temporal_ordering,
         )
-        pdag = self._apply_orientation_rules_deterministic(pdag, apply_r4=apply_r4)
-        return self._pdag_to_dag_deterministic(pdag)
+        pdag = self._apply_meek_rules(pdag, apply_r4=apply_r4)
+        dag_representation = self._build_dag_representation(pdag)
+        self._annotate_tf_skeleton_stats(dag_representation)
+        self._annotate_atac_ci_stats(dag_representation)
+        return CellPCResult(
+            cell_index=int(cell_index),
+            pdag=pdag,
+            dag_representation=dag_representation,
+        )
 
-    def run_pc_for_task(self, task_id):
-        self.clear_task_cache()
-        graph = self.run_pc(int(task_id))
-        self._annotate_tf_skeleton_stats(graph)
-        self._annotate_atac_ci_stats(graph)
-        return int(task_id), graph
-
-    def run_pc_tasks(self, max_workers=None, backend="serial", task_ids=None):
+    def infer_pc_batch(self, max_workers=None, backend="serial", cell_indices=None) -> List[CellPCResult]:
         if backend not in CELL_BACKENDS:
             raise ValueError(f"Unsupported backend: {backend}")
-        if task_ids is None:
-            task_ids = range(len(self.df))
-        task_ids = [int(task_id) for task_id in task_ids]
-        if backend == "serial" or len(task_ids) <= 1:
-            return [self.run_pc_for_task(task_id) for task_id in task_ids]
+        if cell_indices is None:
+            cell_indices = range(len(self.df))
+        cell_indices = sorted(int(cell_index) for cell_index in cell_indices)
+        if backend == "serial" or len(cell_indices) <= 1:
+            return [self.infer_cell_pc(cell_index) for cell_index in cell_indices]
         worker_count = max_workers or os.cpu_count() or 1
-        chunk_size = max(1, (len(task_ids) + (worker_count * 4) - 1) // (worker_count * 4))
-        task_batches = [task_ids[idx: idx + chunk_size] for idx in range(0, len(task_ids), chunk_size)]
+        chunk_size = max(1, (len(cell_indices) + (worker_count * 4) - 1) // (worker_count * 4))
+        cell_batches = [cell_indices[idx: idx + chunk_size] for idx in range(0, len(cell_indices), chunk_size)]
         outputs = []
         with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_pc_worker, initargs=(self,)) as executor:
-            futures = [executor.submit(_run_pc_worker_batch, batch) for batch in task_batches]
+            futures = [executor.submit(_run_pc_worker_batch, batch) for batch in cell_batches]
             for future in futures:
                 outputs.extend(future.result())
-        outputs.sort(key=lambda item: item[0])
+        outputs.sort(key=lambda result: result.cell_index)
         return outputs
 
     def __getstate__(self):

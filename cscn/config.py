@@ -8,6 +8,8 @@ from typing import Optional
 ANALYSIS_MODES = {"regulatory", "representation"}
 NMF_MODES = {"off", "auto", "force"}
 QUERY_ENGINES = {"bitmap", "hybrid", "kdt_debug"}
+CI_ALTERNATIVES = {"two-sided", "greater"}
+COLLIDER_CONFLICT_POLICIES = {"prioritize_existing", "overwrite"}
 PARALLEL_SCOPES = {"none", "module", "cell"}
 INPUT_MODALITIES = {"scrna", "paired_multiome"}
 MODULE_BACKENDS = {"wgcna", "multiome_refined_wgcna"}
@@ -52,6 +54,8 @@ class RunConfig:
     atac_ci_mode: str = "none"
     atac_ci_open_threshold: float = 0.0
     atac_ci_profile_mode: str = "max"
+    ci_alternative: str = "two-sided"
+    collider_conflict_policy: str = "prioritize_existing"
 
     def validate(self) -> "RunConfig":
         if self.analysis_mode not in ANALYSIS_MODES:
@@ -60,6 +64,12 @@ class RunConfig:
             raise ValueError(f"Unsupported nmf_mode: {self.nmf_mode}")
         if self.query_engine not in QUERY_ENGINES:
             raise ValueError(f"Unsupported query_engine: {self.query_engine}")
+        if self.ci_alternative not in CI_ALTERNATIVES:
+            raise ValueError(f"Unsupported ci_alternative: {self.ci_alternative}")
+        if self.collider_conflict_policy not in COLLIDER_CONFLICT_POLICIES:
+            raise ValueError(
+                f"Unsupported collider_conflict_policy: {self.collider_conflict_policy}"
+            )
         if self.atac_ci_mode not in ATAC_CI_MODES:
             raise ValueError(f"Unsupported atac_ci_mode: {self.atac_ci_mode}")
         if self.atac_ci_profile_mode not in ATAC_CI_PROFILE_MODES:

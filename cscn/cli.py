@@ -8,6 +8,8 @@ from .config import (
     ATAC_CI_MODES,
     ATAC_CI_PROFILE_MODES,
     BETA_MODES,
+    CI_ALTERNATIVES,
+    COLLIDER_CONFLICT_POLICIES,
     EDGE_WEIGHT_MODES,
     MULTIOME_SKELETON_PRIOR_MODES,
     MULTIOME_SKELETON_WEIGHT_MODES,
@@ -22,6 +24,12 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--nmf-components", type=int, default=100)
     parser.add_argument("--nmf-max-iter", type=int, default=50000)
     parser.add_argument("--query-engine", choices=["bitmap", "hybrid", "kdt_debug"], default="hybrid")
+    parser.add_argument("--ci-alternative", choices=sorted(CI_ALTERNATIVES), default="two-sided")
+    parser.add_argument(
+        "--collider-conflict-policy",
+        choices=sorted(COLLIDER_CONFLICT_POLICIES),
+        default="prioritize_existing",
+    )
     parser.add_argument("--pc-variant", choices=["stable", "orig"], default="stable")
     parser.add_argument("--max-cond-vars", type=int, default=20)
     parser.add_argument("--significance-level", type=float, default=0.01)
@@ -156,6 +164,8 @@ def command_run(args: argparse.Namespace) -> None:
         nmf_components=args.nmf_components,
         nmf_max_iter=args.nmf_max_iter,
         query_engine=args.query_engine,
+        ci_alternative=args.ci_alternative,
+        collider_conflict_policy=args.collider_conflict_policy,
         pc_variant=args.pc_variant,
         max_cond_vars=args.max_cond_vars,
         significance_level=args.significance_level,
@@ -189,12 +199,20 @@ def command_run(args: argparse.Namespace) -> None:
         payload = {
             "module_name": result.module_name,
             "result_dir": str(result.result_dir),
-            "results_path": str(result.results_path),
+            "pc_pdag_path": str(result.pc_pdag_path),
+            "dag_representation_path": str(result.dag_representation_path),
+            "atac_prior_graph_path": (
+                None
+                if result.atac_prior_graph_path is None
+                else str(result.atac_prior_graph_path)
+            ),
             "manifest_path": str(result.manifest_path),
             "cell_count": result.cell_count,
             "node_count": result.node_count,
             "used_nmf": result.used_nmf,
             "nmf_components_used": result.nmf_components_used,
+            "ci_alternative": config.ci_alternative,
+            "collider_conflict_policy": config.collider_conflict_policy,
             "tf_prior_mode": result.tf_prior_mode,
             "tf_prior_source": config.tf_prior_source,
             "multiome_skeleton_prior_mode": config.multiome_skeleton_prior_mode,
@@ -219,10 +237,19 @@ def command_run(args: argparse.Namespace) -> None:
                 {
                     "module_name": module.module_name,
                     "result_dir": str(module.result_dir),
+                    "pc_pdag_path": str(module.pc_pdag_path),
+                    "dag_representation_path": str(module.dag_representation_path),
+                    "atac_prior_graph_path": (
+                        None
+                        if module.atac_prior_graph_path is None
+                        else str(module.atac_prior_graph_path)
+                    ),
                     "cell_count": module.cell_count,
                     "node_count": module.node_count,
                     "used_nmf": module.used_nmf,
                     "nmf_components_used": module.nmf_components_used,
+                    "ci_alternative": config.ci_alternative,
+                    "collider_conflict_policy": config.collider_conflict_policy,
                     "tf_prior_mode": module.tf_prior_mode,
                     "tf_prior_source": config.tf_prior_source,
                     "multiome_skeleton_prior_mode": config.multiome_skeleton_prior_mode,

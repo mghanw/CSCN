@@ -9,13 +9,15 @@ import networkx as nx
 import numpy as np
 
 
-RESULTS_FILENAME = "results.npz"
+PC_PDAG_FILENAME = "pc_pdag.npz"
+DAG_REPRESENTATION_FILENAME = "dag_representation.npz"
+ATAC_PRIOR_GRAPH_FILENAME = "atac_prior_graph.npz"
 MANIFEST_FILENAME = "run_manifest.json"
 DEBUG_STATE_FILENAME = "debug_state.pkl"
 
 
 @dataclass(frozen=True)
-class CompactDagBatch:
+class CompactGraphBatch:
     cell_ids: np.ndarray
     node_count: int
     cell_edge_offsets: np.ndarray
@@ -31,7 +33,9 @@ class CompactDagBatch:
 @dataclass(frozen=True)
 class ResultPaths:
     result_dir: Path
-    results_path: Path
+    pc_pdag_path: Path
+    dag_representation_path: Path
+    atac_prior_graph_path: Path
     manifest_path: Path
     debug_state_path: Path
 
@@ -39,25 +43,27 @@ class ResultPaths:
 def build_result_paths(result_dir: Path) -> ResultPaths:
     return ResultPaths(
         result_dir=result_dir,
-        results_path=result_dir / RESULTS_FILENAME,
+        pc_pdag_path=result_dir / PC_PDAG_FILENAME,
+        dag_representation_path=result_dir / DAG_REPRESENTATION_FILENAME,
+        atac_prior_graph_path=result_dir / ATAC_PRIOR_GRAPH_FILENAME,
         manifest_path=result_dir / MANIFEST_FILENAME,
         debug_state_path=result_dir / DEBUG_STATE_FILENAME,
     )
 
 
-def dag_to_compact_arrays(dag, node_count: int, integer_dtype, node_names: Sequence[object] | None = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def graph_to_compact_arrays(graph, node_count: int, integer_dtype, node_names: Sequence[object] | None = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     if node_names is None:
         node_names = list(range(node_count))
     if len(node_names) != node_count:
         raise ValueError(f"node_names has length {len(node_names)}, expected {node_count}")
     node_to_idx = {node_name: idx for idx, node_name in enumerate(node_names)}
-    dag_with_all_nodes = dag.copy()
-    dag_with_all_nodes.add_nodes_from(node_names)
+    graph_with_all_nodes = graph.copy()
+    graph_with_all_nodes.add_nodes_from(node_names)
     adjacency_lists: List[List[int]] = []
     node_ptr = np.zeros(node_count + 1, dtype=np.int32)
     total_edges = 0
     for source_idx, source_name in enumerate(node_names):
-        targets = sorted(node_to_idx[target] for target in dag_with_all_nodes.successors(source_name) if target in node_to_idx)
+        targets = sorted(node_to_idx[target] for target in graph_with_all_nodes.successors(source_name) if target in node_to_idx)
         adjacency_lists.append(targets)
         total_edges += len(targets)
         node_ptr[source_idx + 1] = total_edges
@@ -68,8 +74,8 @@ def dag_to_compact_arrays(dag, node_count: int, integer_dtype, node_names: Seque
         if width:
             targets[cursor: cursor + width] = np.asarray(entries, dtype=integer_dtype)
             cursor += width
-    if nx.is_directed_acyclic_graph(dag_with_all_nodes):
-        topo_named = list(nx.topological_sort(dag_with_all_nodes))
+    if nx.is_directed_acyclic_graph(graph_with_all_nodes):
+        topo_named = list(nx.topological_sort(graph_with_all_nodes))
         topo_order = np.asarray([node_to_idx[node_name] for node_name in topo_named if node_name in node_to_idx], dtype=integer_dtype)
         if topo_order.shape[0] != node_count:
             raise ValueError(f"Topological order has {topo_order.shape[0]} nodes, expected {node_count}")
@@ -78,24 +84,24 @@ def dag_to_compact_arrays(dag, node_count: int, integer_dtype, node_names: Seque
     return node_ptr, topo_order, targets
 
 
-def pack_dag_records(records: Sequence[Tuple[int, object]], node_count: int, node_names: Sequence[object] | None = None) -> CompactDagBatch:
-    ordered = sorted(((int(task_id), dag) for task_id, dag in records), key=lambda item: item[0])
+def pack_graph_records(records: Sequence[Tuple[int, object]], node_count: int, node_names: Sequence[object] | None = None) -> CompactGraphBatch:
+    ordered = sorted(((int(cell_index), graph) for cell_index, graph in records), key=lambda item: item[0])
     integer_dtype = np.int16 if node_count <= np.iinfo(np.int16).max else np.int32
-    cell_ids = np.asarray([task_id for task_id, _ in ordered], dtype=np.int32)
+    cell_ids = np.asarray([cell_index for cell_index, _ in ordered], dtype=np.int32)
     node_ptrs = np.zeros((len(ordered), node_count + 1), dtype=np.int32)
     topo_orders = np.zeros((len(ordered), node_count), dtype=integer_dtype)
     cell_edge_offsets = np.zeros(len(ordered) + 1, dtype=np.int64)
     target_chunks: List[np.ndarray] = []
     edge_cursor = 0
-    for idx, (_, dag) in enumerate(ordered):
-        node_ptr, topo_order, targets = dag_to_compact_arrays(dag, node_count=node_count, integer_dtype=integer_dtype, node_names=node_names)
+    for idx, (_, graph) in enumerate(ordered):
+        node_ptr, topo_order, targets = graph_to_compact_arrays(graph, node_count=node_count, integer_dtype=integer_dtype, node_names=node_names)
         node_ptrs[idx] = node_ptr
         topo_orders[idx] = topo_order
         target_chunks.append(targets)
         edge_cursor += int(targets.shape[0])
         cell_edge_offsets[idx + 1] = edge_cursor
     packed_targets = np.concatenate(target_chunks) if target_chunks else np.empty(0, dtype=integer_dtype)
-    return CompactDagBatch(
+    return CompactGraphBatch(
         cell_ids=cell_ids,
         node_count=int(node_count),
         cell_edge_offsets=cell_edge_offsets,
@@ -105,12 +111,12 @@ def pack_dag_records(records: Sequence[Tuple[int, object]], node_count: int, nod
     )
 
 
-def save_compact_results(result_dir: Path, records: Sequence[Tuple[int, object]], node_count: int, manifest: Dict[str, object], node_names: Sequence[object] | None = None) -> ResultPaths:
-    result_dir.mkdir(parents=True, exist_ok=True)
-    paths = build_result_paths(result_dir)
-    batch = pack_dag_records(records, node_count=node_count, node_names=node_names)
+def save_graph_batch(graph_path: Path, records: Sequence[Tuple[int, object]], node_count: int, node_names: Sequence[object] | None = None) -> Path:
+    graph_path = Path(graph_path)
+    graph_path.parent.mkdir(parents=True, exist_ok=True)
+    batch = pack_graph_records(records, node_count=node_count, node_names=node_names)
     np.savez_compressed(
-        paths.results_path,
+        graph_path,
         cell_ids=batch.cell_ids,
         node_count=np.int32(batch.node_count),
         cell_edge_offsets=batch.cell_edge_offsets,
@@ -118,24 +124,30 @@ def save_compact_results(result_dir: Path, records: Sequence[Tuple[int, object]]
         targets=batch.targets,
         topo_orders=batch.topo_orders,
     )
+    return graph_path
+
+
+def load_graph_batch(graph_path: Path) -> CompactGraphBatch:
+    graph_path = Path(graph_path)
+    if not graph_path.exists():
+        raise FileNotFoundError(graph_path)
+    with np.load(graph_path, allow_pickle=False) as payload:
+        return CompactGraphBatch(
+            cell_ids=np.asarray(payload['cell_ids'], dtype=np.int32),
+            node_count=int(np.asarray(payload['node_count']).item()),
+            cell_edge_offsets=np.asarray(payload['cell_edge_offsets'], dtype=np.int64),
+            node_ptrs=np.asarray(payload['node_ptrs'], dtype=np.int32),
+            targets=np.asarray(payload['targets']),
+            topo_orders=np.asarray(payload['topo_orders']),
+        )
+
+
+def save_manifest(result_dir: Path, manifest: Dict[str, object]) -> Path:
+    paths = build_result_paths(Path(result_dir))
+    paths.result_dir.mkdir(parents=True, exist_ok=True)
     with paths.manifest_path.open('w', encoding='utf-8') as handle:
         json.dump(manifest, handle, indent=2)
-    return paths
-
-
-def load_compact_results(result_dir: Path) -> CompactDagBatch:
-    paths = build_result_paths(result_dir)
-    if not paths.results_path.exists():
-        raise FileNotFoundError(paths.results_path)
-    payload = np.load(paths.results_path, allow_pickle=False)
-    return CompactDagBatch(
-        cell_ids=np.asarray(payload['cell_ids'], dtype=np.int32),
-        node_count=int(np.asarray(payload['node_count']).item()),
-        cell_edge_offsets=np.asarray(payload['cell_edge_offsets'], dtype=np.int64),
-        node_ptrs=np.asarray(payload['node_ptrs'], dtype=np.int32),
-        targets=np.asarray(payload['targets']),
-        topo_orders=np.asarray(payload['topo_orders']),
-    )
+    return paths.manifest_path
 
 
 def load_manifest(result_dir: Path) -> Dict[str, object]:
@@ -144,13 +156,13 @@ def load_manifest(result_dir: Path) -> Dict[str, object]:
         return json.load(handle)
 
 
-def cell_target_slice(batch: CompactDagBatch, cell_pos: int) -> np.ndarray:
+def cell_target_slice(batch: CompactGraphBatch, cell_pos: int) -> np.ndarray:
     start = int(batch.cell_edge_offsets[cell_pos])
     stop = int(batch.cell_edge_offsets[cell_pos + 1])
     return batch.targets[start:stop]
 
 
-def decode_cell_edges(batch: CompactDagBatch, cell_pos: int) -> List[Tuple[int, int]]:
+def decode_cell_edges(batch: CompactGraphBatch, cell_pos: int) -> List[Tuple[int, int]]:
     local_targets = cell_target_slice(batch, cell_pos)
     node_ptr = batch.node_ptrs[cell_pos]
     edges: List[Tuple[int, int]] = []
@@ -164,7 +176,7 @@ def decode_cell_edges(batch: CompactDagBatch, cell_pos: int) -> List[Tuple[int, 
     return edges
 
 
-def iter_cell_compact(batch: CompactDagBatch) -> Iterator[Tuple[int, np.ndarray, np.ndarray, np.ndarray]]:
+def iter_cell_compact(batch: CompactGraphBatch) -> Iterator[Tuple[int, np.ndarray, np.ndarray, np.ndarray]]:
     for cell_pos, cell_id in enumerate(batch.cell_ids.tolist()):
         yield (
             int(cell_id),

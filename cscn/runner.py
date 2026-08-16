@@ -15,14 +15,16 @@ from scipy import sparse
 
 from .config import RunConfig
 from .core import CSCN
-from .results import build_result_paths, save_compact_results
+from .results import build_result_paths, save_graph_batch, save_manifest
 
 
 @dataclass(frozen=True)
 class RunResult:
     module_name: str
     result_dir: Path
-    results_path: Path
+    pc_pdag_path: Path
+    dag_representation_path: Path
+    atac_prior_graph_path: Optional[Path]
     manifest_path: Path
     cell_count: int
     node_count: int
@@ -46,26 +48,61 @@ def should_use_nmf(config: RunConfig, n_genes: int) -> bool:
     return config.analysis_mode == 'representation' and n_genes > 150
 
 
-def module_result_exists(result_dir: Path) -> bool:
+def module_result_exists(result_dir: Path, config: Optional[RunConfig] = None) -> bool:
     paths = build_result_paths(result_dir)
-    return paths.results_path.exists() and paths.manifest_path.exists()
+    if not (
+        paths.pc_pdag_path.exists()
+        and paths.dag_representation_path.exists()
+        and paths.manifest_path.exists()
+    ):
+        return False
+    with paths.manifest_path.open('r', encoding='utf-8') as handle:
+        manifest = json.load(handle)
+    manifest_tf_prior_mode = str(manifest.get('tf_prior_mode', 'none') or 'none')
+    expects_atac_prior_graph = manifest_tf_prior_mode == 'atac_prior_cscn'
+    if paths.atac_prior_graph_path.exists() != expects_atac_prior_graph:
+        return False
+    if config is None:
+        return True
+    requested_tf_prior_mode = _resolve_tf_prior_mode(config)
+    return (
+        str(manifest.get('ci_alternative', 'two-sided')) == str(config.ci_alternative)
+        and manifest.get('collider_conflict_policy') == config.collider_conflict_policy
+        and manifest_tf_prior_mode == requested_tf_prior_mode
+    )
 
 
 def load_existing_run_result(result_dir: Path) -> RunResult:
     paths = build_result_paths(result_dir)
+    required_paths = (
+        paths.pc_pdag_path,
+        paths.dag_representation_path,
+        paths.manifest_path,
+    )
+    missing_paths = [path for path in required_paths if not path.exists()]
+    if missing_paths:
+        raise FileNotFoundError(", ".join(str(path) for path in missing_paths))
     with paths.manifest_path.open('r', encoding='utf-8') as handle:
         manifest = json.load(handle)
     module_name = str(manifest.get('module_name') or result_dir.name)
+    tf_prior_mode = str(manifest.get('tf_prior_mode', 'none') or 'none')
+    atac_prior_graph_path = None
+    if tf_prior_mode == 'atac_prior_cscn':
+        if not paths.atac_prior_graph_path.exists():
+            raise FileNotFoundError(paths.atac_prior_graph_path)
+        atac_prior_graph_path = paths.atac_prior_graph_path
     return RunResult(
         module_name=module_name,
         result_dir=paths.result_dir,
-        results_path=paths.results_path,
+        pc_pdag_path=paths.pc_pdag_path,
+        dag_representation_path=paths.dag_representation_path,
+        atac_prior_graph_path=atac_prior_graph_path,
         manifest_path=paths.manifest_path,
         cell_count=int(manifest.get('barcodes_count', 0) or 0),
         node_count=int(manifest.get('node_count', 0) or 0),
         used_nmf=bool(manifest.get('use_nmf_applied', False)),
         nmf_components_used=int(manifest.get('nmf_components_used', 0) or 0),
-        tf_prior_mode=str(manifest.get('tf_prior_mode', 'none') or 'none'),
+        tf_prior_mode=tf_prior_mode,
     )
 
 
@@ -92,6 +129,8 @@ def _build_manifest(module_name: str, expression_df: pd.DataFrame, config: RunCo
         'nmf_components_used': int(cscn.nmf_components_used),
         'pc_variant': config.pc_variant,
         'query_engine': config.query_engine,
+        'ci_alternative': config.ci_alternative,
+        'collider_conflict_policy': config.collider_conflict_policy,
         'significance_level': float(config.significance_level),
         'max_cond_vars': int(config.max_cond_vars),
         'sigmoid_score': float(config.sigmoid_score),
@@ -139,18 +178,16 @@ def _build_manifest(module_name: str, expression_df: pd.DataFrame, config: RunCo
         'tf_weighted_satisfied_weight': float(getattr(cscn, 'tf_weighted_satisfied_weight', 0.0) or 0.0),
         'tf_weighted_available_weight': float(getattr(cscn, 'tf_weighted_available_weight', 0.0) or 0.0),
         'tf_weighted_satisfaction_rate': float(getattr(cscn, 'tf_weighted_satisfaction_rate', 0.0) or 0.0),
-        'tf_weighted_reversed_pc_edge_count': int(getattr(cscn, 'tf_weighted_reversed_pc_edge_count', 0) or 0),
-        'tf_weighted_cycle_avoidance_flip_count': int(getattr(cscn, 'tf_weighted_cycle_avoidance_flip_count', 0) or 0),
-        'tf_weighted_forced_cycle_edge_count': int(getattr(cscn, 'tf_weighted_forced_cycle_edge_count', 0) or 0),
+        'tf_weighted_prior_reoriented_edge_count': int(getattr(cscn, 'tf_weighted_prior_reoriented_edge_count', 0) or 0),
         'tf_weighted_prior_conflict_edge_count': int(getattr(cscn, 'tf_weighted_prior_conflict_edge_count', 0) or 0),
         'tf_skeleton_prior_pair_count': int(getattr(cscn, 'tf_skeleton_prior_pair_count', 0) or 0),
         'tf_skeleton_ci_query_count': int(getattr(cscn, 'tf_skeleton_ci_query_count', 0) or 0),
-        'tf_skeleton_rescued_ci_count': int(getattr(cscn, 'tf_skeleton_rescued_ci_count', 0) or 0),
+        'tf_skeleton_prior_supported_retention_count': int(getattr(cscn, 'tf_skeleton_prior_supported_retention_count', 0) or 0),
         'tf_cell_activity_prior_pair_count': int(getattr(cscn, 'tf_cell_activity_prior_pair_count', 0) or 0),
         'external_prior_allowed_edge_count': int(getattr(cscn, 'external_prior_allowed_edge_count', 0) or 0),
         'combined_prior_allowed_edge_count': int(getattr(cscn, 'combined_prior_allowed_edge_count', 0) or 0),
         'external_skeleton_ci_query_count': int(getattr(cscn, 'external_skeleton_ci_query_count', 0) or 0),
-        'external_skeleton_rescued_ci_count': int(getattr(cscn, 'external_skeleton_rescued_ci_count', 0) or 0),
+        'external_skeleton_prior_supported_retention_count': int(getattr(cscn, 'external_skeleton_prior_supported_retention_count', 0) or 0),
     }
 
 
@@ -344,16 +381,16 @@ def _count_direct_tf_edges(records: Sequence[Tuple[int, object]], direct_pairs: 
     if not direct_pairs:
         return 0
     total = 0
-    for _, dag in records:
-        total += sum(1 for edge in dag.edges() if (str(edge[0]), str(edge[1])) in direct_pairs)
+    for _, graph in records:
+        total += sum(1 for edge in graph.edges() if (str(edge[0]), str(edge[1])) in direct_pairs)
     return int(total)
 
 
 def _record_discovery_stats(cscn: CSCN, records: Sequence[Tuple[int, object]]) -> None:
     cscn.tf_skeleton_ci_query_count = int(sum(int(graph.graph.get('tf_skeleton_ci_query_count', 0) or 0) for _, graph in records))
-    cscn.tf_skeleton_rescued_ci_count = int(sum(int(graph.graph.get('tf_skeleton_rescued_ci_count', 0) or 0) for _, graph in records))
+    cscn.tf_skeleton_prior_supported_retention_count = int(sum(int(graph.graph.get('tf_skeleton_prior_supported_retention_count', 0) or 0) for _, graph in records))
     cscn.external_skeleton_ci_query_count = int(sum(int(graph.graph.get('external_skeleton_ci_query_count', 0) or 0) for _, graph in records))
-    cscn.external_skeleton_rescued_ci_count = int(sum(int(graph.graph.get('external_skeleton_rescued_ci_count', 0) or 0) for _, graph in records))
+    cscn.external_skeleton_prior_supported_retention_count = int(sum(int(graph.graph.get('external_skeleton_prior_supported_retention_count', 0) or 0) for _, graph in records))
     cscn.atac_ci_gate_query_count = int(sum(int(graph.graph.get('atac_ci_gate_query_count', 0) or 0) for _, graph in records))
     cscn.atac_ci_gate_applied_count = int(sum(int(graph.graph.get('atac_ci_gate_applied_count', 0) or 0) for _, graph in records))
     cscn.atac_ci_gate_zero_key_count = int(sum(int(graph.graph.get('atac_ci_gate_zero_key_count', 0) or 0) for _, graph in records))
@@ -406,6 +443,8 @@ def run_module(
         significance_level=config.significance_level,
         max_cond_vars=config.max_cond_vars,
         query_engine=config.query_engine,
+        ci_alternative=config.ci_alternative,
+        collider_conflict_policy=config.collider_conflict_policy,
         max_bits_cache_entries=config.max_bits_cache_entries,
         tf_prior_mode=effective_tf_prior_mode,
         allowed_undirected_pairs=allowed_pair_set,
@@ -444,34 +483,59 @@ def run_module(
             metadata=atac_ci_metadata,
         )
     cell_backend = 'process' if config.parallel_scope == 'cell' else 'serial'
-    records = cscn.run_pc_tasks(max_workers=config.workers, backend=cell_backend)
-    _record_discovery_stats(cscn, records)
+    pc_results = cscn.infer_pc_batch(max_workers=config.workers, backend=cell_backend)
+    pdag_records = [
+        (result.cell_index, result.pdag)
+        for result in pc_results
+    ]
+    dag_representation_records = [
+        (result.cell_index, result.dag_representation)
+        for result in pc_results
+    ]
+    _record_discovery_stats(cscn, dag_representation_records)
+    active_graph_records = dag_representation_records
     if effective_tf_prior_mode in tf_weighted_modes:
-        records = cscn.apply_tf_weighted_orientation(
-            records,
-            allow_cycles=True,
-            projection_only=False,
-        )
-    cscn.tf_direct_edge_count = _count_direct_tf_edges(records, cscn.tf_direct_supported_pairs)
+        active_graph_records = cscn.build_atac_prior_graphs(pc_results)
+    cscn.tf_direct_edge_count = _count_direct_tf_edges(active_graph_records, cscn.tf_direct_supported_pairs)
     node_values_file = None
     if cscn.use_nmf_applied:
         node_values_file = 'node_values.npy'
         np.save(result_dir / node_values_file, np.asarray(cscn.data, dtype=np.float32))
     manifest = _build_manifest(module_name, expression_df, config, cscn, node_values_file=node_values_file)
-    paths = save_compact_results(
-        result_dir,
-        records,
+    paths = build_result_paths(result_dir)
+    save_graph_batch(
+        paths.pc_pdag_path,
+        pdag_records,
         node_count=int(cscn.data.shape[1]),
-        manifest=manifest,
         node_names=cscn.df.columns.tolist(),
     )
+    save_graph_batch(
+        paths.dag_representation_path,
+        dag_representation_records,
+        node_count=int(cscn.data.shape[1]),
+        node_names=cscn.df.columns.tolist(),
+    )
+    atac_prior_graph_path = None
+    if effective_tf_prior_mode in tf_weighted_modes:
+        save_graph_batch(
+            paths.atac_prior_graph_path,
+            active_graph_records,
+            node_count=int(cscn.data.shape[1]),
+            node_names=cscn.df.columns.tolist(),
+        )
+        atac_prior_graph_path = paths.atac_prior_graph_path
+    else:
+        paths.atac_prior_graph_path.unlink(missing_ok=True)
+    save_manifest(result_dir, manifest)
     if config.save_debug_state:
         with paths.debug_state_path.open('wb') as handle:
             pickle.dump(cscn, handle, protocol=pickle.HIGHEST_PROTOCOL)
     return RunResult(
         module_name=module_name,
         result_dir=paths.result_dir,
-        results_path=paths.results_path,
+        pc_pdag_path=paths.pc_pdag_path,
+        dag_representation_path=paths.dag_representation_path,
+        atac_prior_graph_path=atac_prior_graph_path,
         manifest_path=paths.manifest_path,
         cell_count=int(expression_df.shape[0]),
         node_count=int(cscn.data.shape[1]),
@@ -541,7 +605,7 @@ def run_directory(module_dir: Path, result_root: Path, config: RunConfig) -> Run
     pending_paths: List[Path] = []
     for path in module_paths:
         module_result_dir = result_root / path.stem
-        if module_result_exists(module_result_dir):
+        if module_result_exists(module_result_dir, config=config):
             results.append(load_existing_run_result(module_result_dir))
         else:
             pending_paths.append(path)
